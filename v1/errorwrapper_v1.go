@@ -1,31 +1,16 @@
 package errorwrapper
 
-import "strings"
-
-const (
-	defaultErrJoiner byte   = 0x2E // Default character to join prefixes, which is '.'
-	defaultMsgJoiner string = ": " // Default string to join prefixes and messages
+import (
+	"errors"
+	"strings"
 )
 
-// errorString is a simple struct that satisfies the error interface.
-type errorString struct {
-	s string
-}
+const (
+	defaultErrJoiner byte   = '.'
+	defaultMsgJoiner string = ": "
+)
 
-// Error implements the error interface for errorString.
-func (e *errorString) Error() string {
-	return e.s
-}
-
-// ErrorWrapper defines the interface for creating and wrapping errors.
-type ErrorWrapper interface {
-	// NewError wraps an existing error with a new message.
-	NewError(err error, msg ...string) error
-	// NewErrorString creates a new error from a string and wraps it with a message.
-	NewErrorString(errStr string, msg ...string) error
-}
-
-// errWrapper is the concrete implementation of the ErrorWrapper interface.
+// errWrapper holds context for building formatted error messages.
 type errWrapper struct {
 	err       error
 	msg       string
@@ -33,16 +18,20 @@ type errWrapper struct {
 	errJoiner byte
 }
 
-// Statically assert that *errWrapper implements the ErrorWrapper interface.
-// This line will cause a compile-time error if the interface is not satisfied.
+// ErrorWrapper creates and wraps errors with prefix chains.
+type ErrorWrapper interface {
+	// NewError wraps err with the wrapper's prefix and an optional message.
+	NewError(err error, msg ...string) error
+	// NewErrorString creates a new error from errStr and wraps it.
+	NewErrorString(errStr string, msg ...string) error
+}
+
 var _ ErrorWrapper = (*errWrapper)(nil)
 
-// New creates and returns a new ErrorWrapper.
-// It accepts an optional joiner byte for prefixes and an optional initial prefix string.
+// New returns an ErrorWrapper with the given joiner byte and optional prefix.
+// If errJoiner is zero, the default '.' is used.
 func New(errJoiner byte, prefix ...string) ErrorWrapper {
-	ew := &errWrapper{
-		errJoiner: errJoiner,
-	}
+	ew := &errWrapper{errJoiner: errJoiner}
 	if ew.errJoiner == 0 {
 		ew.errJoiner = defaultErrJoiner
 	}
@@ -52,25 +41,39 @@ func New(errJoiner byte, prefix ...string) ErrorWrapper {
 	return ew
 }
 
-// unwrapRecursively traverses a chain of errWrapper errors.
-// It returns the combined prefix of all wrappers and the root, non-wrapper error.
-func unwrapRecursively(err error, joiner byte) (string, error) {
-	if ew, ok := err.(*errWrapper); ok {
-		recursivePrefix, underlyingErr := unwrapRecursively(ew.err, joiner)
-		var sb strings.Builder
-		sb.WriteString(ew.prefix)
-		if ew.prefix != "" && recursivePrefix != "" {
-			sb.WriteByte(joiner)
-		}
-		sb.WriteString(recursivePrefix)
-		return sb.String(), underlyingErr
+// collectPrefixes walks the errWrapper chain rooted at err, returning the
+// joiner-separated prefix string and the first non-errWrapper error.
+func collectPrefixes(err error, joiner byte) (string, error) {
+	ew, ok := err.(*errWrapper)
+	if !ok {
+		return "", err
 	}
-	return "", err
+	if _, ok = ew.err.(*errWrapper); !ok {
+		return ew.prefix, ew.err
+	}
+	var (
+		sb    strings.Builder
+		first = true
+	)
+	for {
+		if ew.prefix != "" {
+			if !first {
+				sb.WriteByte(joiner)
+			}
+			sb.WriteString(ew.prefix)
+			first = false
+		}
+		err = ew.err
+		ew, ok = err.(*errWrapper)
+		if !ok {
+			break
+		}
+	}
+	return sb.String(), err
 }
 
-// NewError wraps an existing error with the wrapper's prefix and a new message.
-// If the error being wrapped is also an errWrapper, it combines their prefixes.
-func (ew errWrapper) NewError(err error, msg ...string) error {
+// NewError wraps err with the receiver's prefix, merging any errWrapper chain.
+func (ew *errWrapper) NewError(err error, msg ...string) error {
 	if err == nil {
 		return nil
 	}
@@ -79,24 +82,32 @@ func (ew errWrapper) NewError(err error, msg ...string) error {
 		tmpMsg = msg[0]
 	}
 	var (
-		unwPrefix, undErr = unwrapRecursively(err, ew.errJoiner)
-		sb                strings.Builder
+		mergedPrefix            string
+		combinedPrefix, rootErr = collectPrefixes(err, ew.errJoiner)
 	)
-	sb.WriteString(ew.prefix)
-	if ew.prefix != "" && unwPrefix != "" {
+	switch {
+	case ew.prefix == "":
+		mergedPrefix = combinedPrefix
+	case combinedPrefix == "":
+		mergedPrefix = ew.prefix
+	default:
+		var sb strings.Builder
+		sb.Grow(len(ew.prefix) + 1 + len(combinedPrefix))
+		sb.WriteString(ew.prefix)
 		sb.WriteByte(ew.errJoiner)
+		sb.WriteString(combinedPrefix)
+		mergedPrefix = sb.String()
 	}
-	sb.WriteString(unwPrefix)
 	return &errWrapper{
-		prefix:    sb.String(),
-		err:       undErr,
+		prefix:    mergedPrefix,
+		err:       rootErr,
 		msg:       tmpMsg,
 		errJoiner: ew.errJoiner,
 	}
 }
 
-// NewErrorString wraps a new error, created from a string, with the wrapper's prefix and a message.
-func (ew errWrapper) NewErrorString(errStr string, msg ...string) error {
+// NewErrorString creates a new error from errStr and wraps it with the receiver's prefix.
+func (ew *errWrapper) NewErrorString(errStr string, msg ...string) error {
 	if errStr == "" {
 		return nil
 	}
@@ -105,37 +116,51 @@ func (ew errWrapper) NewErrorString(errStr string, msg ...string) error {
 		tmpMsg = msg[0]
 	}
 	return &errWrapper{
-		prefix: ew.prefix,
-		err:    &errorString{errStr},
-		msg:    tmpMsg,
+		prefix:    ew.prefix,
+		err:       errors.New(errStr),
+		msg:       tmpMsg,
+		errJoiner: ew.errJoiner,
 	}
 }
 
-// Error implements the error interface for errWrapper, formatting the output string.
-func (ew errWrapper) Error() string {
+// Error formats the error as "prefix: [msg] err".
+func (ew *errWrapper) Error() string {
+	var errStr string
+	if ew.err != nil {
+		errStr = ew.err.Error()
+	}
 	var (
-		sb          strings.Builder
-		isMsgFilled bool = ew.msg != ""
+		isMsgFilled = ew.msg != ""
+		total       = len(errStr)
 	)
+	if ew.prefix != "" {
+		total += len(ew.prefix) + len(defaultMsgJoiner)
+	}
+	if isMsgFilled {
+		total += 2 + len(ew.msg)
+		if errStr != "" {
+			total++
+		}
+	}
+	var sb strings.Builder
+	sb.Grow(total)
 	if ew.prefix != "" {
 		sb.WriteString(ew.prefix)
 		sb.WriteString(defaultMsgJoiner)
 	}
 	if isMsgFilled {
-		sb.WriteByte(0x5B)
+		sb.WriteByte('[')
 		sb.WriteString(ew.msg)
-		sb.WriteByte(0x5D)
-	}
-	if ew.err != nil {
-		if isMsgFilled {
-			sb.WriteByte(0x20)
+		sb.WriteByte(']')
+		if errStr != "" {
+			sb.WriteByte(' ')
 		}
-		sb.WriteString(ew.err.Error())
 	}
+	sb.WriteString(errStr)
 	return sb.String()
 }
 
-// Unwrap returns the underlying wrapped error, allowing for error chain inspection.
+// Unwrap returns the underlying error for use with errors.Is and errors.As.
 func (ew *errWrapper) Unwrap() error {
 	return ew.err
 }

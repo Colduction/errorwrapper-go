@@ -1,3 +1,3 @@
-module github.com/colduction/errorwrapper
+module github.com/colduction/errorwrapper-go
 
-go 1.25.3
+go 1.26.3
