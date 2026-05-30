@@ -42,3 +42,9 @@ err3 := e3.NewError(err2, "query failed")
 
 - Returns `nil` when given a `nil` error or an empty string.
 - Prefix chains are flattened automatically when wrappers are nested.
+
+---
+
+## License
+
+This project is licensed under the terms of the [MIT License](LICENSE).
